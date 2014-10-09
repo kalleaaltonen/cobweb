@@ -15,6 +15,12 @@ gem 'namespaced_redis', ">=1.0.2"
 gem 'redis-namespace'
 gem 'slop'
 
+# Will be remove as soon as "resque" in oma-models is moved from Gemfile to oma-models.gemspec.
+gem "resque", "~> 2.0.0.pre.1", github: "resque/resque"
+gem 'resque-scheduler'
+gem 'resque-retry'
+
+
 group :test do
   gem 'rspec'
   gem 'rspec-core'

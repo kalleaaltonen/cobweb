@@ -1,10 +1,9 @@
 require 'rubygems'
-require 'resque/tasks'
 require 'rspec/core/rake_task'
-require [File.dirname(__FILE__), "lib", "cobweb"].join("/") 
+require [File.dirname(__FILE__), "lib", "cobweb"].join("/")
 
 task :default => :spec
- 
+
 RSpec::Core::RakeTask.new do |t|
   ENV['RUBY_ENVIRONMENT'] = "test"
   t.pattern = "./spec/**/*_spec.rb" # don't need this, it's default.

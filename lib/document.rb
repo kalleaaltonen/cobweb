@@ -59,6 +59,7 @@ class DocumentScope
   def count
     @context ? @context.count : 0
   end
+
   def to_s
     @context ? @context.to_s.gsub("\n","") : ""
   end

@@ -100,6 +100,7 @@ class Cobweb
 
     # set initial depth
     request[:depth] = 1
+
     @redis = Redis::Namespace.new("cobweb:#{request[:crawl_id]}", :redis => RedisConnection.new(request[:redis_options]))
     @redis.set("original_base_url", base_url)
     @redis.hset "statistics", "queued_at", DateTime.now
@@ -112,6 +113,9 @@ class Cobweb
         @redis.hset "data", key.to_s, @options[:data][key]
       end
     end
+
+    # adds the options set to the statistics for subsequent processing
+    @redis.hset "statistics", "options", @options.to_json
 
     # setup robots delay
     # this part is a bit weird, It requires resque-scheduler, but resque is
@@ -129,13 +133,16 @@ class Cobweb
       @redis.set("robots:next_retrieval", Time.now)
     end
 
-    @options[:seed_urls].map{|link| @redis.sadd "queued", link }
+    # add the original URL to the request queue if it exists
+    @redis.sadd "queued", request[:url] if request[:url]
 
     @stats = CobwebStats.new(request)
     @stats.start_crawl(request)
 
     # add internal_urls into redis
-    @options[:internal_urls].map{|url| @redis.sadd("internal_urls", url)}
+    @options[:internal_urls].map{ |url| @redis.sadd('internal_urls', url) }
+
+    # queue the original one
     if @options[:queue_system] == :resque
       Resque.enqueue(CrawlJob, request)
     elsif @options[:queue_system] == :sidekiq
@@ -144,6 +151,15 @@ class Cobweb
       raise "Unknown queue system: #{content_request[:queue_system]}"
     end
 
+    # queue the seed_urls as well into jobs
+    duplicate_request = request.dup
+    @options[:seed_urls].map do |link|
+      duplicate_request[:url] = link
+      Resque.enqueue(CrawlJob, duplicate_request)
+      @redis.sadd "queued", link
+    end
+
+    # and return the original request
     request
   end
 

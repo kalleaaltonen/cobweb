@@ -14,6 +14,7 @@ gem 'namespaced_redis', ">=1.0.2"
 
 gem 'redis-namespace'
 gem 'slop'
+gem 'typhoeus' # swapping out http for this
 
 # Will be remove as soon as "resque" in oma-models is moved from Gemfile to oma-models.gemspec.
 gem "resque", "~> 2.0.0.pre.1", github: "resque/resque"

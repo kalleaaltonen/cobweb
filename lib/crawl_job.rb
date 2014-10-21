@@ -1,19 +1,13 @@
-require "net/https"
-require "uri"
-require "redis"
+require 'net/https'
+require 'uri'
+require 'redis'
+require 'resque/errors'
 
 # crawljob does the main retrival and handles creation of the processing
 # job. Uses the class crawl to do most of the actual work.
 class CrawlJob
   @queue = :cobweb_crawl_job
-
   VERBOSE = true
-
-  def self.stats
-    size = Resque.size(@queue)
-    failed_count = Resque::Failure.all.select {|job| job['payload']['class'] == 'CrawlJob' }.count
-    { queued: size, failed: failed_count }
-  end
 
   # allows a console interface to do one iteration of the Resque queue
   def self.do_one
@@ -28,98 +22,85 @@ class CrawlJob
     end
   end
 
-  # requeues up to 1000 jobs based on crawl id
-  def self.requeue_failed_jobs(crawl_id)
-    delete_indexes = []
-    requeued_count = 0
-    Resque::Failure::Redis.all(0,1000).each_with_index do |job, index|
-      next if job['queue'] != @queue.to_s
-      next if job['payload']['args'][0]['crawl_id'] != crawl_id
-      requeued_count += 1
-      Resque::Failure.requeue(index)
-      delete_indexes << index
-    end
-    delete_indexes.each {|index| Resque::Failure.remove(index) }
-    logger.info "CrawlJob REQUEUE #{requeued_count} at #{Time.now}"
-    true
-  end
-
-  def self.failed_jobs_for_crawl(crawl_id)
-    failed_jobs.select do |job|
-      job['payload']['args'][0]['crawl_id'] == crawl_id
-    end
-  end
-
-  def self.failed_jobs
-    Resque::Failure::Redis.all(0,1000).select do |job|
-      job['payload']['class'] == 'CrawlJob' rescue []
-    end
-  end
-
   # Resque perform method to maintain the crawl, enqueue
   # found links and detect the end of crawl
   def self.perform(content_request)
-    # setup the crawl class to manage the crawl of this object
-    @crawl = CobwebModule::Crawl.new(content_request)
-    if @crawl.already_crawled?(content_request['url'])
-      @crawl.redis.srem('currently_running', content_request['url'])
-      logger.warn "CrawlJob WARN AlreadyCrawledURL #{content_request['url']}"
-    else
-      logger.info "CrawlJob PERFORMSTART URL #{content_request['url']}"
-      # update the counters and then perform the get, returns
-      # false if we are outwith limits
-      if @crawl.retrieve
-        # if the crawled object is an object type we are
-        # moved out the procedssing to make this method shorter and
-        # easier to read
-        if @crawl.content.permitted_type?
-          if @crawl.to_be_processed?
-            @crawl, queued_links_count = queue_new_links_for_crawling(@crawl, content_request)
-            @crawl, redirected_links_count = handle_redirects(@crawl, content_request)
-            queued_links_count += redirected_links_count # add redirects
-            begin
-              @crawl = do_crawl_processing(@crawl, content_request)
-              @crawl.store_graph_data
-            rescue => e
-              logger.error "Cobweb::CrawlJob ERROR #{e.inspect}"
-              logger.error "#{e.backtrace.join("\n")}"
-            end
-            @crawl.print_counters
-          else
-            @crawl.logger.debug "@crawl.finished? #{@crawl.finished?}"
-            @crawl.logger.debug "@crawl.within_crawl_limits? #{@crawl.within_crawl_limits?}"
-            @crawl.logger.debug "@crawl.first_to_finish? #{@crawl.first_to_finish?}"
-          end # if permitted content type
-        else
-          # @crawl.print_counters
-          # not a valid content type for processing
-          @crawl.logger.warn "CrawlJob: Invalid MimeType #{content_request.inspect}"
-        end
+    begin
+
+      # create a jobID that is in the logs, so we can find logging for
+      # this job should it fail
+      job_id = Array.new(32){[*'0'..'9', *'a'..'z', *'A'..'Z'].sample}.join
+      content_request["last_job_id"] = job_id
+      working_url = content_request["url"]
+      crawl_retrieved_flag = false
+      # setup the crawl class to manage the crawl of this object
+      @crawl = CobwebModule::Crawl.new(content_request)
+      # set the job id so we store it in Redis, for troubleshooting purposes
+      # and can be removed
+      @crawl.redis.hset("job_ids", working_url, job_id) # for troubleshooting url
+      # to jobs, to find their logging in the logs
+
+      if @crawl.already_crawled?(content_request['url'])
+        @crawl.redis.srem('currently_running', content_request['url'])
+        @crawl.logger.warn "CrawlJob WARN AlreadyCrawledURL #{working_url}"
       else
-        @crawl.print_counters
-        @crawl.logger.warn "CrawlJob: Retrieve FALSE #{content_request['url']}"
-      end
-
-
-      @crawl.lock("finished") do
-        # mark the queues as done with this processing
-        @crawl.finished_processing
-        # test queue and crawl sizes to see if we have completed the crawl
-        if @crawl.finished?
-          @crawl.logger.debug "Calling crawl_job finished"
-          finished(content_request)
+        @crawl.logger.debug "CrawlJob START ID:#{job_id} URL #{working_url}"
+        # update the counters and then perform the get, returns
+        # false if we are outwith limits
+        if @crawl.retrieve
+          crawl_retrieved_flag = true
+          # if the crawled object is an object type we are
+          # moved out the procedssing to make this method shorter and
+          # easier to read
+          if @crawl.content.permitted_type?
+            if @crawl.to_be_processed?
+              @crawl, queued_links_count = queue_new_links_for_crawling(@crawl, content_request)
+              @crawl, redirected_links_count = handle_redirects(@crawl, content_request)
+              queued_links_count += redirected_links_count # add redirects
+              begin
+                @crawl = do_crawl_processing(@crawl, content_request)
+                @crawl.store_graph_data
+              rescue => e
+                logger.error "Cobweb::CrawlJob ERROR #{e.inspect}"
+                logger.error "#{e.backtrace.join("\n")}"
+              end
+              @crawl.print_counters
+            else
+              @crawl.logger.debug "CrawlJob ToBeProcessed:FALSE Finished?#{@crawl.finished?} WithinLimit:#{@crawl.within_crawl_limits?} FirstFinish:#{@crawl.first_to_finish?}"
+            end # if permitted content type
+          else
+            # @crawl.print_counters
+            # not a valid content type for processing
+            @crawl.logger.warn "CrawlJob: Invalid MimeType #{content_request.inspect}"
+          end
+        else
+          @crawl.logger.warn "CrawlJob: Retrieve FALSE #{content_request['url']}"
         end
-      end
 
-      # ensure our existing URL has been removed from the
-      # currently processing list
-      @crawl.redis.srem('currently_running', content_request['url'])
-      @crawl.logger.debug "CrawlJob Code:#{@crawl.content.status_code} URL:#{content_request[:url]}"
-      current_failed_job_count = Array(CrawlJob.failed_jobs_for_crawl(content_request['crawl_id'])).count
-      @crawl.logger.debug "Failed Jobs: #{current_failed_job_count}" if current_failed_job_count > 0
-      @crawl.print_counters
+        @crawl.lock("finished") do
+          # mark the queues as done with this processing
+          @crawl.redis.srem('currently_running', content_request['url'])
+          @crawl.finished_processing
+          # test queue and crawl sizes to see if we have completed the crawl
+          if @crawl.finished?
+            @crawl.logger.debug "Calling crawl_job finished"
+            finished(content_request)
+          end
+        end
+
+        # ensure our existing URL has been removed from the
+        # currently processing list
+        @crawl.logger.debug "CrawlJob JobID: #{job_id} Code:#{@crawl.content.status_code} URL:#{content_request[:url]}"
+        current_failed_job_count = Array(CrawlJob.failed_jobs_for_crawl(content_request['crawl_id'])).count
+        @crawl.logger.debug "Failed Jobs: #{current_failed_job_count}" if current_failed_job_count > 0
+        @crawl.print_counters
+      end
+      @crawl
+    rescue Resque::TermException
+      logger.error "CrawlJob TERM Exception #{content_request}"
+      CrawlJob.on_failure_retry(content_request)
+      logger.error "CrawlJob REQUEUED REQUEST"
     end
-    @crawl
   end
 
   # Sets the crawl status to CobwebCrawlHelper::FINISHED and enqueues the crawl finished job
@@ -212,6 +193,20 @@ class CrawlJob
     crawl_object
   end
 
+  def self.on_failure_retry(*args)
+    error = args[0]
+    content_request = args[1]
+    logger.info "CrawlJob JOBFAILED #{error.inspect} #{content_request[:last_job_id]} #{content_request[:url]}"
+    content_request[:retries] = 0 if content_request[:retries].nil?
+    content_request[:retries] += 1
+    if content_request[:retries] < 3
+      Resque.enqueue self, content_request
+      logger.warn "CrawlJob FailureRETRY #{content_request}"
+    else
+      logger.error "CrawlJob ABSOLUTEFAILURE  #{content_request}"
+    end
+  end
+
   # class-based logging
   def self.logger
     Logger.new(STDOUT)
@@ -223,5 +218,4 @@ class CrawlJob
       redis: RedisConnection.new(content_request['redis_options'])
     )
   end
-
 end

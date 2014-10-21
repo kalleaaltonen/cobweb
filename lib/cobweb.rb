@@ -3,6 +3,7 @@ require 'uri'
 require "addressable/uri"
 require 'digest/sha1'
 require 'base64'
+require 'typhoeus'
 
 Dir[File.dirname(__FILE__) + '/**/*.rb'].each do |file|
   require file
@@ -50,7 +51,7 @@ class Cobweb
     default_debug_to                          false
     default_cache_to                          300
     default_cache_type_to                     :crawl_based # other option is :full
-    default_timeout_to                        10
+    default_timeout_to                        30
     default_redis_options_to                  Hash.new
     default_internal_urls_to                  []
     default_external_urls_to                  []
@@ -123,7 +124,6 @@ class Cobweb
     # whether this is the right way to do this
     if @options[:respect_robots_delay]
       @robots = robots_constructor(base_url, @options)
-      puts "Robots is: #{@robots.inspect}"
       if @robots.respond_to?(:delay)
         delay_set = @robots.delay || 0.5 # should be setup as an options with a default value
       else
@@ -470,6 +470,8 @@ class Cobweb
             puts "Not storing in cache as cache disabled" if @options[:debug]
           end
         end
+        # add headers
+        content[:headers] = HashUtil.deep_symbolize_keys(response.to_hash)
       rescue RedirectError => e
         raise e if @options[:raise_exceptions]
         logger.error "ERROR RedirectError: #{e.message}"
@@ -521,7 +523,6 @@ class Cobweb
 
       content
     end
-
   end
 
   # escapes characters with meaning in regular expressions and adds wildcard expression
@@ -546,6 +547,15 @@ class Cobweb
       return true if content_type.match(Cobweb.escape_pattern_for_regex(mime_type))
     end
     false
+  end
+
+  def ok_to_retrieve?(url)
+    if url.include?('.htm') || url.include?('.php')
+      resp = Cobweb.new(url).head(url)
+      puts "#{resp.inspect}"
+    else
+
+    end
   end
 
 end

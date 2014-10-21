@@ -159,7 +159,8 @@ module CobwebModule
         end
 
       rescue => e
-        logger.warn "#{e.inspect} #{e.backtrace}"
+        logger.warn "Cobweb::Crawl ERROR StoringGraphData #{e.inspect}"
+        logger.warn "#{e.backtrace}"
       end
     end
 
@@ -213,7 +214,7 @@ module CobwebModule
     end
 
     def content
-      raise "Content is not available" if @content.nil?
+      logger.info "Cobweb::Crawl WARN ContentNotAvailable" if @content.nil?
       CobwebModule::CrawlObject.new(@content, @options)
     end
 

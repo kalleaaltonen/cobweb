@@ -3,7 +3,7 @@ $:.push File.expand_path("../lib", __FILE__)
 require 'cobweb_version'
 
 Gem::Specification.new do |s|
-  
+
   s.name              = "cobweb"
   s.version           = CobwebVersion.version
   s.author            = "Stewart McKee"
@@ -26,4 +26,5 @@ Gem::Specification.new do |s|
   s.add_dependency('redis-namespace')
   s.add_dependency('json')
   s.add_dependency('slop')
+  s.add_dependency('typhoeus')
 end

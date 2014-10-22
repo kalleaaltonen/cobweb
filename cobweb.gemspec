@@ -12,7 +12,7 @@ Gem::Specification.new do |s|
   s.platform          = Gem::Platform::RUBY
   s.description       = "Cobweb is a web crawler that can use resque to cluster crawls to quickly crawl extremely large sites which is much more performant than multi-threaded crawlers.  It is also a standalone crawler that has a sophisticated statistics monitoring interface to monitor the progress of the crawls."
   s.summary           = "Cobweb is a web crawler that can use resque to cluster crawls to quickly crawl extremely large sites faster than multi-threaded crawlers.  It is also a standalone crawler that has a sophisticated statistics monitoring interface to monitor the progress of the crawls."
-  s.files             = Dir["{spec,lib,views,public}/**/*"].delete_if { |f| f =~ /(rdoc)$/i }
+  s.files             = Dir["{spec,lib}/**/*"].delete_if { |f| f =~ /(rdoc)$/i }
   s.require_path      = "lib"
   s.has_rdoc          = false
   s.license           = 'MIT'
@@ -21,8 +21,6 @@ Gem::Specification.new do |s|
   s.add_dependency('nokogiri')
   s.add_dependency('addressable')
   s.add_dependency('awesome_print')
-  s.add_dependency('sinatra')
-  s.add_dependency('haml')
   s.add_dependency('redis-namespace')
   s.add_dependency('json')
   s.add_dependency('slop')

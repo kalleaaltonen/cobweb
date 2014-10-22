@@ -1,6 +1,6 @@
 module CobwebModule
   # the main crawler class for cobweb. Gets instantiated to do all the
-  # cobweb-based crawling
+  # cobweb-based crawling using cobweb class to retrieve
   class Crawl
     attr_accessor :redis
 
@@ -126,11 +126,10 @@ module CobwebModule
       @content_link_parser ||= ContentLinkParser.new(@options[:url], content.body, @options)
     end
 
+    # store the links from this page linking TO other pages for
+    # retrieval and processing of the inbound link processing in finishing stages
     def store_graph_data
       begin
-        # store the links from this page linking TO other pages for
-        # retrieval and processing of the inbound link processing in finishing stages
-
         if @options[:store_inbound_links] && Array(content_link_parser.internal_links).length > 0
           source_url_hexdigest = Digest::MD5.hexdigest(content.url.to_s)
           Array(content_link_parser.internal_links).each do |link|
@@ -140,18 +139,17 @@ module CobwebModule
               uri = URI.parse(URI.encode(link))
             end
             destination_url_hexdigest = Digest::MD5.hexdigest(uri.to_s)
-            @redis.hset("digest2url", destination_url_hexdigest, uri.to_s)
+            @redis.hset('digest2url', destination_url_hexdigest, uri.to_s)
             unless source_url_hexdigest == destination_url_hexdigest
               @redis.sadd("inbound_links:#{destination_url_hexdigest}",
-                         source_url_hexdigest) if ["http", "https"].include?(uri.scheme)
+                         source_url_hexdigest) if ['http', 'https'].include?(uri.scheme)
             end
           end
         end
 
-
         if @options[:store_inbound_anchor_text]
-          Array(content_link_parser.full_link_data.select {|link| link["type"] == "link"}).each do |inbound_link|
-            target_uri = UriHelper.parse(inbound_link["link"])
+          Array(content_link_parser.full_link_data.select {|link| link['type'] == 'link'}).each do |inbound_link|
+            target_uri = UriHelper.parse(inbound_link['link'])
             unless content.url.to_s == target_uri.to_s
               @redis.sadd("inbound_anchors:#{Digest::MD5.hexdigest(target_uri.to_s)}", inbound_link["text"].downcase )
             end
@@ -405,7 +403,7 @@ module CobwebModule
     end
 
     def counters
-      "CrawlID:#{@options[:crawl_id]}\n Queued: #{@redis.scard("queued")} Running: #{@redis.scard("currently_running")} Crawled: #{crawl_counter} QueueCounter: #{queue_counter} ProcessCounter: #{process_counter} Limit: #{@options[:crawl_limit]}"
+      "CrawlID:#{@options[:crawl_id]} Queued: #{@redis.scard("queued")} Running: #{@redis.scard("currently_running")} Crawled: #{crawl_counter}  ProcessCounter: #{process_counter}"
     end
 
     # Sets the base url in redis.  If the first page is a redirect, it sets the base_url to the destination

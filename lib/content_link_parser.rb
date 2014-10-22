@@ -33,7 +33,8 @@ class ContentLinkParser
   end
 
 
-  # extracts link data from nokogiri with attributes on each link (rel, follow, anchor text, title, alt)
+  # extracts link data from nokogiri with attributes on each
+  # link (rel, follow, anchor text, title, alt)
   def full_link_data
     full_link_data = []
     options_to_check = @options[:tags][:links] + @options[:tags][:images]

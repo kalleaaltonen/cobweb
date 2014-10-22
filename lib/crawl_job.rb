@@ -22,6 +22,11 @@ class CrawlJob
     end
   end
 
+  # take a look at a job in the queue
+  def self.peek
+    Resque.peek("#{@queue}")[0]['args']
+  end
+
   # Resque perform method to maintain the crawl, enqueue
   # found links and detect the end of crawl
   def self.perform(content_request)
@@ -91,9 +96,6 @@ class CrawlJob
         # ensure our existing URL has been removed from the
         # currently processing list
         @crawl.logger.debug "CrawlJob JobID: #{job_id} Code:#{@crawl.content.status_code} URL:#{content_request[:url]}"
-        current_failed_job_count = Array(CrawlJob.failed_jobs_for_crawl(content_request['crawl_id'])).count
-        @crawl.logger.debug "Failed Jobs: #{current_failed_job_count}" if current_failed_job_count > 0
-        @crawl.print_counters
       end
       @crawl
     rescue Resque::TermException

@@ -9,63 +9,16 @@ Dir[File.dirname(__FILE__) + '/**/*.rb'].each do |file|
   require file
 end
 
-puts Gem::Specification.find_all_by_name("sidekiq", ">=3.0.0")
-
-
-# Cobweb class is used to perform get and head requests.  You can use this on its own if you wish without the crawler
+# Cobweb class is used to perform get and head requests.
+# You can use this on its own if you wish without the crawler
 class Cobweb
-
   attr_reader :options
-
-  # retrieves current version
-  def self.version
-    CobwebVersion.version
-  end
-
-  # used for setting default options
-  def method_missing(method_sym, *arguments, &block)
-    if method_sym.to_s =~ /^default_(.*)_to$/
-      tag_name = method_sym.to_s.split("_")[1..-2].join("_").to_sym
-      @options[tag_name] = arguments[0] unless @options.has_key?(tag_name)
-    else
-      super
-    end
-  end
 
   # See readme for more information on options available
   def initialize(options = {})
     @options = options
-    @options[:data] = {} if @options[:data].nil?
-    default_use_encoding_safe_process_job_to  false
-    default_follow_redirects_to               true
-    default_redirect_limit_to                 10
-    default_queue_system_to                   :resque
-    if @options[:queue_system] == :resque
-      default_processing_queue_to               "CobwebProcessJob"
-      default_crawl_finished_queue_to           "CobwebFinishedJob"
-    else
-      default_processing_queue_to               "CrawlProcessWorker"
-      default_crawl_finished_queue_to           "CrawlFinishedWorker"
-    end
-    default_quiet_to                          true
-    default_debug_to                          false
-    default_cache_to                          300
-    default_cache_type_to                     :crawl_based # other option is :full
-    default_timeout_to                        30
-    default_redis_options_to                  Hash.new
-    default_internal_urls_to                  []
-    default_external_urls_to                  []
-    default_seed_urls_to                  []
-    default_first_page_redirect_internal_to   true
-    default_text_mime_types_to                ["text/*", "application/xhtml+xml"]
-    default_obey_robots_to                    false
-    default_user_agent_to                     "cobweb/#{Cobweb.version} (ruby/#{RUBY_VERSION} nokogiri/#{Nokogiri::VERSION})"
-    default_valid_mime_types_to                ["*/*"]
-    default_raise_exceptions_to               false
-    default_store_inbound_links_to            false
-    default_proxy_addr_to                     nil
-    default_proxy_port_to                     nil
-
+    set_additional_options
+    @content = Content.new
   end
 
   def logger
@@ -82,87 +35,6 @@ class Cobweb
     end
   end
 
-  # This method starts the resque based crawl and enqueues the base_url
-  def start(base_url)
-    raise ":base_url is required" unless base_url
-    request = {
-      :crawl_id => crawl_id,
-      :url => base_url
-    }
-
-    if @options[:internal_urls].nil? || @options[:internal_urls].empty?
-      uri = Addressable::URI.parse(base_url)
-      @options[:internal_urls] = []
-      @options[:internal_urls] << [uri.scheme, "://", uri.host, "/*"].join
-      @options[:internal_urls] << [uri.scheme, "://", uri.host, ":", uri.inferred_port, "/*"].join
-    end
-
-    request.merge!(@options)
-
-    # set initial depth
-    request[:depth] = 1
-
-    @redis = Redis::Namespace.new("cobweb:#{request[:crawl_id]}", :redis => RedisConnection.new(request[:redis_options]))
-    @redis.set("original_base_url", base_url)
-    @redis.hset "statistics", "queued_at", DateTime.now
-    @redis.set("crawl-counter", 0)
-    @redis.set("queue-counter", 1)
-
-    # adds the @options["data"] to the global space so it can be retrieved with a simple redis query
-    if @options[:data]
-      @options[:data].keys.each do |key|
-        @redis.hset "data", key.to_s, @options[:data][key]
-      end
-    end
-
-    # adds the options set to the statistics for subsequent processing
-    @redis.hset "statistics", "options", @options.to_json
-
-    # setup robots delay
-    # this part is a bit weird, It requires resque-scheduler, but resque is
-    # not a gem that is required by cobweb.  So, this is a bit weird and i question
-    # whether this is the right way to do this
-    if @options[:respect_robots_delay]
-      @robots = robots_constructor(base_url, @options)
-      if @robots.respond_to?(:delay)
-        delay_set = @robots.delay || 0.5 # should be setup as an options with a default value
-      else
-        delay_set = 0.5
-      end
-      @redis.set("robots:per_page_delay", delay_set)
-      @redis.set("robots:next_retrieval", Time.now)
-    end
-
-    # add the original URL to the request queue if it exists
-    @redis.sadd "queued", request[:url] if request[:url]
-
-    @stats = CobwebStats.new(request)
-    @stats.start_crawl(request)
-
-    # add internal_urls into redis
-    @options[:internal_urls].map{ |url| @redis.sadd('internal_urls', url) }
-
-    # queue the original one
-    if @options[:queue_system] == :resque
-      Resque.enqueue(CrawlJob, request)
-    elsif @options[:queue_system] == :sidekiq
-      CrawlWorker.perform_async(request)
-    else
-      raise "Unknown queue system: #{content_request[:queue_system]}"
-    end
-
-    # queue the seed_urls as well into jobs
-    duplicate_request = request.dup
-    @options[:seed_urls].map do |link|
-      duplicate_request[:url] = link
-      Resque.enqueue(CrawlJob, duplicate_request)
-      @redis.sadd "queued", link
-    end
-
-    # and return the original request
-    request
-  end
-
   # Returns array of cookies from content
   def get_cookies(response)
     all_cookies = response.get_fields('set-cookie')
@@ -175,354 +47,58 @@ class Cobweb
     end
   end
 
-  # Performs a HTTP GET request to the specified url applying the options supplied
   def get(url, options = @options)
-    raise "url cannot be nil" if url.nil?
-    uri = Addressable::URI.parse(url)
-    uri.normalize!
-    uri.fragment=nil
-    url = uri.to_s
-
-    # get the unique id for this request
-    unique_id = Digest::SHA1.hexdigest(url.to_s)
-    if options.has_key?(:redirect_limit) and !options[:redirect_limit].nil?
-      redirect_limit = options[:redirect_limit].to_i
-    else
-      redirect_limit = 10
-    end
-
-    # connect to redis
-    if options.has_key? :crawl_id
-      redis = Redis::Namespace.new("cobweb:#{options[:crawl_id]}", :redis => RedisConnection.new(@options[:redis_options]))
-    else
-      redis = Redis::Namespace.new("cobweb", :redis => RedisConnection.new(@options[:redis_options]))
-    end
-    full_redis = Redis::Namespace.new("cobweb", :redis => RedisConnection.new(@options[:redis_options]))
-
-    content = {:base_url => url}
-
-    # check if it has already been cached
-    if ((@options[:cache_type] == :crawl_based && redis.get(unique_id)) || (@options[:cache_type] == :full && full_redis.get(unique_id))) && @options[:cache]
-      if @options[:cache_type] == :crawl_based
-        logger.info "Cache hit in crawl for #{url}" unless @options[:quiet]
-        content = HashUtil.deep_symbolize_keys(Marshal.load(redis.get(unique_id)))
-      else
-        logger.info "Cache hit for #{url}" unless @options[:quiet]
-        content = HashUtil.deep_symbolize_keys(Marshal.load(full_redis.get(unique_id)))
-      end
-    else
-      # retrieve data
-      #unless @http && @http.address == uri.host && @http.port == uri.inferred_port
-        logger.debug "Creating connection to #{uri.host}..." if @options[:debug]
-        @http = Net::HTTP.new(uri.host, uri.inferred_port, @options[:proxy_addr], @options[:proxy_port])
-      #end
-      if uri.scheme == "https"
-        @http.use_ssl = true
-        @http.verify_mode = OpenSSL::SSL::VERIFY_NONE
-      end
-
-      request_time = Time.now.to_f
-      @http.read_timeout = @options[:timeout].to_i
-      @http.open_timeout = @options[:timeout].to_i
-      begin
-        logger.info "Retrieving #{uri}... " unless @options[:quiet]
-        request_options={}
-        request_options['Cookie']= options[:cookies] if options[:cookies]
-        request_options['User-Agent']= options[:user_agent] if options.has_key?(:user_agent)
-
-        request = Net::HTTP::Get.new uri.request_uri, request_options
-        # authentication
-        if @options[:authentication] == "basic"
-          raise ":username and :password are required if using basic authentication" unless @options[:username] && @options[:password]
-          request.basic_auth @options[:username], @options[:password]
-        end
-        if @options[:range]
-          request.set_range(@options[:range])
-        end
-
-        response = @http.request request
-
-        if @options[:follow_redirects] and response.code.to_i >= 300 and response.code.to_i < 400
-
-          # get location to redirect to
-          uri = UriHelper.join_no_fragment(uri, response['location'])
-          logger.info "Following Redirect to #{uri}... " unless @options[:quiet]
-
-          # decrement redirect limit
-          redirect_limit = redirect_limit - 1
-
-          raise RedirectError, "Redirect Limit reached" if redirect_limit == 0
-          cookies = get_cookies(response)
-
-          # get the content from redirect location
-          content = get(uri, options.merge(:redirect_limit => redirect_limit, :cookies => cookies))
-
-          content[:redirect_through] = [uri.to_s] if content[:redirect_through].nil?
-          content[:redirect_through].insert(0, url)
-          content[:url] = content[:redirect_through].last
-
-          content[:response_time] = Time.now.to_f - request_time
-        else
-          content[:response_time] = Time.now.to_f - request_time
-
-          logger.info "Retrieved." unless @options[:quiet]
-
-          # create the content container
-          content[:url] = uri.to_s
-          content[:status_code] = response.code.to_i
-          content[:mime_type] = ""
-          content[:mime_type] = response.content_type.split(";")[0].strip unless response.content_type.nil?
-
-          if !response["Content-Type"].nil? && response["Content-Type"].include?(";")
-            charset = response["Content-Type"][response["Content-Type"].index(";")+2..-1] if !response["Content-Type"].nil? and response["Content-Type"].include?(";")
-            charset = charset[charset.index("=")+1..-1] if charset and charset.include?("=")
-            content[:character_set] = charset
-          end
-
-          content[:length] = response.content_length
-          content[:text_content] = text_content?(content[:mime_type])
-
-          if text_content?(content[:mime_type])
-            if response["Content-Encoding"]=="gzip"
-              content[:body] = Zlib::GzipReader.new(StringIO.new(response.body)).read
-            else
-              content[:body] = response.body
-            end
-          else
-            content[:body] = Base64.encode64(response.body)
-          end
-
-          content[:location] = response["location"]
-          content[:headers] = HashUtil.deep_symbolize_keys(response.to_hash)
-
-          # parse data for links
-          link_parser = ContentLinkParser.new(content[:url], content[:body], @options)
-
-          content[:links] = link_parser.link_data
-          content[:links][:external] = link_parser.external_links
-          content[:links][:internal] = link_parser.internal_links
-
-          # add an array of images with their attributes for image processing
-          content[:images] = []
-          if @options[:store_image_attributes]
-            Array(link_parser.full_link_data.select {|link| link["type"] == "image"}).each do |inbound_link|
-              inbound_link["link"] = UriHelper.parse(inbound_link["link"])
-              content[:images] << inbound_link
-            end
-          end
-
-        end
-        # add content to cache if required
-        if @options[:cache]
-          if @options[:cache_type] == :crawl_based
-            redis.set(unique_id, Marshal.dump(content))
-            redis.expire unique_id, @options[:cache].to_i
-          else
-            full_redis.set(unique_id, Marshal.dump(content))
-            full_redis.expire unique_id, @options[:cache].to_i
-          end
-        end
-      rescue RedirectError => e
-        raise e if @options[:raise_exceptions]
-        logger.error "ERROR RedirectError: #{e.message}"
-
-        ## generate a blank content
-        content = {}
-        content[:url] = uri.to_s
-        content[:response_time] = Time.now.to_f - request_time
-        content[:status_code] = 0
-        content[:length] = 0
-        content[:body] = ""
-        content[:error] = e.message
-        content[:images] = []
-        content[:mime_type] = "error/dnslookup"
-        content[:headers] = {}
-        content[:links] = {}
-
-      rescue SocketError => e
-        raise e if @options[:raise_exceptions]
-        logger.error "ERROR SocketError: #{e.message}"
-
-        ## generate a blank content
-        content = {}
-        content[:url] = uri.to_s
-        content[:response_time] = Time.now.to_f - request_time
-        content[:status_code] = 0
-        content[:length] = 0
-        content[:body] = ""
-        content[:images] = []
-        content[:error] = e.message
-        content[:mime_type] = "error/dnslookup"
-        content[:headers] = {}
-        content[:links] = {}
-
-      rescue Timeout::Error => e
-        raise e if @options[:raise_exceptions]
-        logger.error "ERROR Timeout::Error: #{e.message}"
-
-        ## generate a blank content
-        content = {}
-        content[:url] = uri.to_s
-        content[:response_time] = Time.now.to_f - request_time
-        content[:status_code] = 0
-        content[:length] = 0
-        content[:images] = []
-        content[:body] = ""
-        content[:error] = e.message
-        content[:mime_type] = "error/serverdown"
-        content[:headers] = {}
-        content[:links] = {}
-      end
-      content
-    end
+    perform(url, 'get', options)
   end
 
-  # Performs a HTTP HEAD request to the specified url applying the options supplied
   def head(url, options = @options)
+    perform(url, 'head', options)
+  end
+
+  # Performs a HTTP request of the requested method type
+  def perform(url, method, options = @options)
     raise "url cannot be nil" if url.nil?
-    uri = Addressable::URI.parse(url)
-    uri.normalize!
-    uri.fragment=nil
-    url = uri.to_s
 
-    # get the unique id for this request
-    unique_id = Digest::SHA1.hexdigest(url)
-    if options.has_key?(:redirect_limit) and !options[:redirect_limit].nil?
-      redirect_limit = options[:redirect_limit].to_i
-    else
-      redirect_limit = 10
+    # normalize the URL and generate a URI object
+    url, uri = normalize_url(url)
+
+    # sets the options for the retrieval
+    set_options
+
+    # create a unique id for this request
+    unique_id = Digest::SHA1.hexdigest(url.to_s)
+
+    # add the url to the return hash
+    @content[:base_url] = url
+
+    # retrieve data
+    begin
+      # request_options['Cookie']= options[:cookies] if options[:cookies]
+      request_parameters[:method] = method
+      set_request_time
+      request = Typhoeus::Request.new(url, request_parameters)
+      raw_response = request.run
+      response = Response.new(raw_response, @options) # use our class parser for Typhoeus
+      logger.info "Cobweb WARN NameLookup #{raw_response.namelookup_time}" if raw_response.namelookup_time > 1.0
+      @content.merge!(response.to_hash)
+      @content[:text_content] = text_content?(@content[:mime_type])
+
+    rescue RedirectError => e
+      raise e if @options[:raise_exceptions]
+      logger.error "ERROR RedirectError: #{e.message}"
+      set_content_to_error(uri.to_s, e.message, "error/redirecterror")
+
+    rescue SocketError => e
+      raise e if @options[:raise_exceptions]
+      logger.error "ERROR SocketError: #{e.message}"
+      set_content_to_error(uri.to_s, e.message, "error/socketerror")
+
+    rescue Timeout::Error => e
+      raise e if @options[:raise_exceptions]
+      logger.error "ERROR Timeout::Error: #{e.message}"
+      set_content_to_error(uri.to_s, e.message, "error/serverdown")
     end
-
-    # connect to redis
-    if options.has_key? :crawl_id
-      redis = Redis::Namespace.new("cobweb:#{options[:crawl_id]}:", :redis => RedisConnection.new(@options[:redis_options]))
-    else
-      redis = Redis::Namespace.new("cobweb", :redis => RedisConnection.new(@options[:redis_options]))
-    end
-
-    content = {:base_url => url}
-
-    # check if it has already been cached
-    if redis.get("head-#{unique_id}") and @options[:cache]
-      logger.info "Cache hit for #{url}" unless @options[:quiet]
-      content = HashUtil.deep_symbolize_keys(Marshal.load(redis.get("head-#{unique_id}")))
-    else
-      # retrieve data
-      unless @http && @http.address == uri.host && @http.port == uri.inferred_port
-        puts "Creating connection to #{uri.host}..." unless @options[:quiet]
-        @http = Net::HTTP.new(uri.host, uri.inferred_port, @options[:proxy_addr], @options[:proxy_port])
-      end
-      if uri.scheme == "https"
-        @http.use_ssl = true
-        @http.verify_mode = OpenSSL::SSL::VERIFY_NONE
-      end
-
-      request_time = Time.now.to_f
-      @http.read_timeout = @options[:timeout].to_i
-      @http.open_timeout = @options[:timeout].to_i
-      begin
-        logger.info "Retrieving #{url }... " unless @options[:quiet]
-        request_options={}
-        if options[:cookies]
-          request_options[ 'Cookie']= options[:cookies]
-        end
-        request = Net::HTTP::Head.new uri.request_uri, request_options
-        # authentication
-        if @options[:authentication] == "basic"
-          raise ":username and :password are required if using basic authentication" unless @options[:username] && @options[:password]
-          request.basic_auth @options[:username], @options[:password]
-        end
-
-        response = @http.request request
-
-        if @options[:follow_redirects] and response.code.to_i >= 300 and response.code.to_i < 400
-          logger.info "redirected... " unless @options[:quiet]
-
-          uri = UriHelper.join_no_fragment(uri, response['location'])
-
-          redirect_limit = redirect_limit - 1
-
-          raise RedirectError, "Redirect Limit reached" if redirect_limit == 0
-          cookies = get_cookies(response)
-
-          content = head(uri, options.merge(:redirect_limit => redirect_limit, :cookies => cookies))
-          content[:url] = uri.to_s
-          content[:redirect_through] = [] if content[:redirect_through].nil?
-          content[:redirect_through].insert(0, url)
-        else
-          content[:url] = uri.to_s
-          content[:status_code] = response.code.to_i
-          unless response.content_type.nil?
-            content[:mime_type] = response.content_type.split(";")[0].strip
-            if response["Content-Type"].include? ";"
-              charset = response["Content-Type"][response["Content-Type"].index(";")+2..-1] if !response["Content-Type"].nil? and response["Content-Type"].include?(";")
-              charset = charset[charset.index("=")+1..-1] if charset and charset.include?("=")
-              content[:character_set] = charset
-            end
-          end
-
-          # add content to cache if required
-          if @options[:cache]
-            logger.info "Stored in cache [head-#{unique_id}]" if @options[:debug]
-            redis.set("head-#{unique_id}", Marshal.dump(content))
-            redis.expire "head-#{unique_id}", @options[:cache].to_i
-          else
-            puts "Not storing in cache as cache disabled" if @options[:debug]
-          end
-        end
-        # add headers
-        content[:headers] = HashUtil.deep_symbolize_keys(response.to_hash)
-      rescue RedirectError => e
-        raise e if @options[:raise_exceptions]
-        logger.error "ERROR RedirectError: #{e.message}"
-
-        ## generate a blank content
-        content = {}
-        content[:url] = uri.to_s
-        content[:response_time] = Time.now.to_f - request_time
-        content[:status_code] = 0
-        content[:length] = 0
-        content[:body] = ""
-        content[:error] = e.message
-        content[:mime_type] = "error/dnslookup"
-        content[:headers] = {}
-        content[:links] = {}
-
-      rescue SocketError => e
-        raise e if @options[:raise_exceptions]
-        logger.error "ERROR SocketError: #{e.message}"
-
-        ## generate a blank content
-        content = {}
-        content[:url] = uri.to_s
-        content[:response_time] = Time.now.to_f - request_time
-        content[:status_code] = 0
-        content[:length] = 0
-        content[:body] = ""
-        content[:error] = e.message
-        content[:mime_type] = "error/dnslookup"
-        content[:headers] = {}
-        content[:links] = {}
-
-      rescue Timeout::Error => e
-        raise e if @options[:raise_exceptions]
-        logger.error "ERROR Timeout::Error: #{e.message}"
-
-        ## generate a blank content
-        content = {}
-        content[:url] = uri.to_s
-        content[:response_time] = Time.now.to_f - request_time
-        content[:status_code] = 0
-        content[:length] = 0
-        content[:body] = ""
-        content[:error] = e.message
-        content[:mime_type] = "error/serverdown"
-        content[:headers] = {}
-        content[:links] = {}
-      end
-
-      content
-    end
+    @content
   end
 
   # escapes characters with meaning in regular expressions and adds wildcard expression
@@ -536,8 +112,125 @@ class Cobweb
 
   def clear_cache;end
 
-  def robots_constructor(base_url, options)
-    Robots.new(:url => base_url, :user_agent => options[:user_agent])
+  def set_options
+    set_proxy_options
+    set_authentication_options
+    set_user_agent
+    set_follow_options
+    set_logging_options
+    set_timeout_options
+    set_redirect_options
+    true
+  end
+
+  # set proxy options if they are needed
+  def set_proxy_options
+    if @options[:proxy_addr] && @options[:proxy_port]
+      request_parameters[:proxy] = "http://#{@options[:proxy_address]}:#{@options[:proxy_port]}"
+      request_parameters[:proxytype] =Typhoeus::Easy::PROXY_TYPES[:CURLPROXY_HTTP]
+      request_parameters[:proxyuserpwd] = "#{@options[:proxy_username]}:#{@options[:proxy_password]}"
+    end
+  end
+
+  # set authentication options if they are needed
+  def set_authentication_options
+    if @options[:username] && @options[:password]
+      request_parameters[:userpwd] = "#{@options[:username]}:#{@options[:password]}"
+    end
+  end
+
+  # set the User Agent for the request
+  def set_user_agent
+    if @options[:user_agent]
+      request_parameters[:headers] = {} if request_parameters[:headers].nil?
+      request_parameters[:headers]["User-Agent"] = @options[:user_agent]
+    end
+  end
+
+  # set followoptions for the request
+  def set_follow_options
+    if @options[:follow_redirects]
+      request_parameters[:followlocation] = @options[:follow_redirects]
+    end
+  end
+
+  # set followoptions for the request
+  def set_logging_options
+    if @options[:verbose]
+      request_parameters[:verbose] = @options[:verbose]
+    end
+  end
+
+  def set_timeout_options
+    if @options[:timeout]
+      request_parameters[:timeout] = @options[:timeout] * 1000
+      request_parameters[:connecttimeout] = (@options[:timeout] / 2).to_i * 1000
+    end
+  end
+
+  def set_redirect_options
+    if @options.has_key?(:redirect_limit) and !@options[:redirect_limit].nil?
+      request_parameters[:maxredirs] = @options[:redirect_limit]
+    else
+      request_parameters[:maxredirs] = 10
+    end
+  end
+
+  # default hash, sets it to ignore ssl errors
+  def request_parameters
+    @request_parameters ||= {
+      ssl_verifypeer: false
+    }
+  end
+
+  # normalize the URL and return the URI and URL
+  def normalize_url(url)
+    uri = Addressable::URI.parse(url)
+    uri.normalize!
+    uri.fragment=nil
+    url = uri.to_s
+    [url, uri]
+  end
+
+  def reset_content_to_blank
+    @content = Content.new
+    @content[:url] = nil
+    @content[:response_time] = 99999999.9
+    @content[:status_code] = 0
+    @content[:length] = 0
+    @content[:body] = ""
+    @content[:error] = nil
+    @content[:images] = []
+    @content[:mime_type] = nil
+    @content[:headers] = {}
+    @content[:links] = {}
+  end
+
+  def set_content_to_error(url, error_message, mime_type)
+    reset_content_to_blank
+    @content[:url] = url
+    @content[:response_time] = Time.now.to_f - @request_time
+    @content[:mime_type] = mime_type
+    @content[:error] = error_message
+  end
+
+  def set_request_time
+    @request_time = Time.now.to_f
+  end
+
+  # retrieves current version
+  def self.version
+    CobwebVersion.version
+  end
+
+  # used for setting default options
+  def method_missing(method_sym, *arguments, &block)
+    if method_sym.to_s =~ /^default_(.*)_to$/
+      tag_name = method_sym.to_s.split("_")[1..-2].join("_").to_sym
+      @options[tag_name] = arguments[0] unless @options.has_key?(tag_name)
+    else
+      super
+    end
   end
 
   private
@@ -549,13 +242,8 @@ class Cobweb
     false
   end
 
-  def ok_to_retrieve?(url)
-    if url.include?('.htm') || url.include?('.php')
-      resp = Cobweb.new(url).head(url)
-      puts "#{resp.inspect}"
-    else
-
-    end
+  def set_additional_options
+    @options[:text_mime_types] = ["text/*", "application/xhtml+xml"] if @options[:text_mime_types].nil?
   end
 
 end

@@ -305,7 +305,8 @@ class Cobweb
             end
             if charset = guessed_charset(response) # favours response
               content[:body_charset] = body_charset response.body
-              content[:body].force_encoding(charset).encode('utf-8')
+              content[:body].force_encoding(charset).encode!('UTF-8', 'binary', invalid: :replace, undef: :replace, replace: '')
+
             end
           else
             content[:body] = Base64.encode64(response.body) unless response.body.nil?
